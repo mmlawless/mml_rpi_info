@@ -310,6 +310,74 @@ collect_all_info() {
 }
 
 ############################################################
+# Email the file
+############################################################
+
+send_email() {
+  local content="$1"
+  local serial="$2"
+  local date_stamp="$3"
+  local email_to="$4"
+  local filename="${serial}_${date_stamp}.txt"
+  
+  # Create temporary file
+  local tmpfile=$(mktemp)
+  echo -e "$content" > "$tmpfile"
+  
+  log_info "Sending email to: $email_to"
+  
+  # Method 1: Try msmtp (recommended - simple to configure)
+  if command -v msmtp &> /dev/null; then
+    (
+      echo "To: $email_to"
+      echo "From: pi@$(hostname)"
+      echo "Subject: Raspberry Pi Info - $serial - $date_stamp"
+      echo "Content-Type: text/plain; charset=UTF-8"
+      echo ""
+      cat "$tmpfile"
+    ) | msmtp "$email_to"
+    
+    if [ $? -eq 0 ]; then
+      rm "$tmpfile"
+      log_success "Email sent successfully via msmtp"
+      return 0
+    fi
+  fi
+  
+  # Method 2: Try sendmail
+  if command -v sendmail &> /dev/null; then
+    (
+      echo "To: $email_to"
+      echo "Subject: Raspberry Pi Info - $serial - $date_stamp"
+      echo ""
+      cat "$tmpfile"
+    ) | sendmail -t
+    
+    if [ $? -eq 0 ]; then
+      rm "$tmpfile"
+      log_success "Email sent successfully via sendmail"
+      return 0
+    fi
+  fi
+  
+  # Method 3: Try mail/mailx
+  if command -v mail &> /dev/null; then
+    mail -s "Raspberry Pi Info - $serial - $date_stamp" "$email_to" < "$tmpfile"
+    
+    if [ $? -eq 0 ]; then
+      rm "$tmpfile"
+      log_success "Email sent successfully via mail"
+      return 0
+    fi
+  fi
+  
+  rm "$tmpfile"
+  log_error "No email client found. Install msmtp, sendmail, or mailx"
+  log_info "To install msmtp: sudo apt-get install msmtp msmtp-mta"
+  return 1
+}
+
+############################################################
 # Save to Dropbox
 ############################################################
 
@@ -366,6 +434,42 @@ save_to_dropbox() {
 # Main Execution
 ############################################################
 
+# Parse command line arguments
+EMAIL_ADDRESS=""
+SKIP_DROPBOX=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --email|-e)
+      EMAIL_ADDRESS="$2"
+      shift 2
+      ;;
+    --no-dropbox)
+      SKIP_DROPBOX=true
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: $0 [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  -e, --email EMAIL    Send results to email address"
+      echo "  --no-dropbox         Skip saving to Dropbox"
+      echo "  -h, --help           Show this help message"
+      echo ""
+      echo "Examples:"
+      echo "  $0                              # Save to Dropbox only"
+      echo "  $0 --email user@example.com     # Email and save to Dropbox"
+      echo "  $0 -e user@example.com --no-dropbox  # Email only"
+      exit 0
+      ;;
+    *)
+      log_error "Unknown option: $1"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
 echo "=========================================="
 echo "Raspberry Pi Information Collector"
 echo "=========================================="
@@ -389,14 +493,19 @@ echo "$INFO"
 echo ""
 
 # Save to Dropbox
-log_info "Saving to Dropbox..."
-if save_to_dropbox "$INFO" "$SERIAL" "$DATE_STAMP"; then
-  log_success "Collection complete!"
-else
-  log_warning "Saved to screen but failed to save to Dropbox"
-  log_info "You can manually save the output above"
+if [ "$SKIP_DROPBOX" = false ]; then
+  log_info "Saving to Dropbox..."
+  save_to_dropbox "$INFO" "$SERIAL" "$DATE_STAMP"
 fi
 
+# Send email if requested
+if [ -n "$EMAIL_ADDRESS" ]; then
+  echo ""
+  send_email "$INFO" "$SERIAL" "$DATE_STAMP" "$EMAIL_ADDRESS"
+fi
+
+echo ""
+log_success "Collection complete!"
 echo ""
 log_info "You can also save this output with:"
 echo "  ./$(basename $0) > ~/rpi_info_${SERIAL}_${DATE_STAMP}.txt"
