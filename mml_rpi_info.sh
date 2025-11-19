@@ -694,7 +694,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=========================================="
-echo "Raspberry Pi Information Collector"
+echo "MML Raspberry Pi Information Collector 1a"
 echo "=========================================="
 echo ""
 
