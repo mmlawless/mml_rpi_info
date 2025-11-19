@@ -4,10 +4,8 @@ set -euo pipefail
 ############################################################
 # Raspberry Pi Information Collector
 # Collects hardware and system information
-# Saves to Dropbox with format: SERIAL_YYYY-MM-DD.txt
-# Also builds a CSV summary and (optionally) emails:
-#   - Subject: Raspberry Pi Info - HOSTNAME - SERIAL - YYYY-MM-DD HH:MM
-#   - CSV attachment: filename is exactly the subject line
+# Saves to Dropbox
+# Sends email with text body + CSV attachment
 ############################################################
 
 RED='\033[0;31m'
@@ -21,7 +19,6 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
-# State file used by your setup script (for PROFILE info)
 STATE_FILE="$HOME/.rpi_setup_state"
 
 ############################################################
@@ -33,49 +30,186 @@ if [ ! -f /proc/cpuinfo ]; then
 fi
 
 ############################################################
+# Helper / detection functions
+############################################################
+
+csv_escape() {
+  # Escape a value for CSV (wrap in quotes if needed, escape quotes)
+  local s="$1"
+  s=${s//\"/\"\"}
+  if [[ "$s" == *","* || "$s" == *$'\n'* || "$s" == *$'\r'* || "$s" == *"\""* ]]; then
+    printf '"%s"' "$s"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+get_boot_config_file() {
+  if [ -f /boot/firmware/config.txt ]; then
+    echo "/boot/firmware/config.txt"
+  elif [ -f /boot/config.txt ]; then
+    echo "/boot/config.txt"
+  else
+    echo ""
+  fi
+}
+
+detect_network_manager() {
+  if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+    echo "dhcpcd"
+  elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    echo "NetworkManager"
+  else
+    echo "unknown"
+  fi
+}
+
+get_spi_state() {
+  local cfg
+  cfg="$(get_boot_config_file)"
+  if [ -n "$cfg" ] && grep -q '^dtparam=spi=on' "$cfg" 2>/dev/null; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+get_i2c_state() {
+  local cfg
+  cfg="$(get_boot_config_file)"
+  if [ -n "$cfg" ] && grep -q '^dtparam=i2c_arm=on' "$cfg" 2>/dev/null; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+get_camera_state() {
+  if command -v vcgencmd >/dev/null 2>&1; then
+    if vcgencmd get_camera 2>/dev/null | grep -q 'supported=1 detected=1'; then
+      echo "enabled"
+    else
+      echo "disabled"
+    fi
+  else
+    echo "unknown"
+  fi
+}
+
+get_swap_total_mb() {
+  free -m | awk '/^Swap:/ {print $2}'
+}
+
+get_swap_state() {
+  local total
+  total=$(get_swap_total_mb)
+  if [ "$total" -ge 1024 ]; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+get_root_fs_stats() {
+  # Returns: total,used,available,use%
+  df -h / | awk 'NR==2 {print $2","$3","$4","$5}'
+}
+
+get_usb_controllers_count() {
+  if [ -d /sys/bus/usb/devices ]; then
+    find /sys/bus/usb/devices -maxdepth 1 -name "usb*" -type d | wc -l
+  else
+    echo "unknown"
+  fi
+}
+
+get_wifi_interface() {
+  iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}'
+}
+
+get_wifi_ssid() {
+  local iface
+  iface="$(get_wifi_interface)"
+  if [ -n "$iface" ] && command -v iwgetid >/dev/null 2>&1; then
+    iwgetid -r 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
+
+get_vnc_state() {
+  if systemctl is-enabled vncserver-x11-serviced.service 2>/dev/null | grep -q enabled; then
+    echo "enabled"
+  else
+    echo "disabled"
+  fi
+}
+
+get_ufw_status() {
+  if command -v ufw >/dev/null 2>&1; then
+    if sudo -n ufw status 2>/dev/null | grep -qw "active"; then
+      echo "enabled"
+    else
+      echo "disabled"
+    fi
+  else
+    echo "not installed"
+  fi
+}
+
+get_setup_profile() {
+  grep PROFILE= "$STATE_FILE" 2>/dev/null | cut -d= -f2 | grep -oE '[^ ]+' || echo "not set"
+}
+
+get_requests_state() {
+  if pip3 list 2>/dev/null | grep -qw requests; then
+    echo "installed"
+  else
+    echo "not installed"
+  fi
+}
+
+get_primary_iface() {
+  ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}'
+}
+
+get_primary_mac_address() {
+  local iface
+  iface="$(get_primary_iface)"
+  if [ -n "$iface" ] && [ -f "/sys/class/net/$iface/address" ]; then
+    cat "/sys/class/net/$iface/address"
+  else
+    echo "N/A"
+  fi
+}
+
+############################################################
 # Collect Information Functions
 ############################################################
 
 get_serial() {
-  # Try multiple methods to get serial number
   local serial=""
-  
-  # Method 1: /proc/cpuinfo
   if [ -f /proc/cpuinfo ]; then
     serial=$(grep -i "^Serial" /proc/cpuinfo | awk '{print $3}' | sed 's/^0*//')
   fi
-  
-  # Method 2: Device tree
   if [ -z "$serial" ] && [ -f /proc/device-tree/serial-number ]; then
     serial=$(tr -d '\0' < /proc/device-tree/serial-number)
   fi
-  
-  # Fallback: use hostname if no serial found
   if [ -z "$serial" ]; then
     serial="unknown_$(hostname)"
   fi
-  
   echo "$serial"
 }
 
 get_model() {
   local model=""
-  
-  # Try device tree first
   if [ -f /proc/device-tree/model ]; then
     model=$(tr -d '\0' < /proc/device-tree/model)
   fi
-  
-  # Fallback to /proc/cpuinfo
   if [ -z "$model" ] && [ -f /proc/cpuinfo ]; then
     model=$(grep -i "^Model" /proc/cpuinfo | cut -d: -f2 | xargs)
   fi
-  
-  # Final fallback
-  if [ -z "$model" ]; then
-    model="Unknown Raspberry Pi"
-  fi
-  
+  [ -z "$model" ] && model="Unknown Raspberry Pi"
   echo "$model"
 }
 
@@ -88,17 +222,14 @@ get_revision() {
 }
 
 get_memory() {
-  # Total RAM in human-readable format
   free -h | awk '/^Mem:/ {print $2}'
 }
 
 get_storage() {
-  # SD card size and usage
   df -h / | awk 'NR==2 {print $2 " (Used: " $3 ", Available: " $4 ", " $5 " used)"}'
 }
 
 get_usb_info() {
-  # Count and list USB devices
   if command -v lsusb &> /dev/null; then
     local usb_count
     usb_count=$(lsusb | wc -l)
@@ -109,23 +240,11 @@ get_usb_info() {
   fi
 }
 
-get_usb_ports() {
-  # Try to determine number of physical USB ports/controllers
-  if [ -d /sys/bus/usb/devices ]; then
-    local ports
-    ports=$(find /sys/bus/usb/devices -name "usb*" -type d | wc -l)
-    echo "$ports USB controllers detected"
-  else
-    echo "Unknown"
-  fi
-}
-
 get_network_interfaces() {
   echo "=== Network Interfaces ==="
   ip -br addr show | grep -v "^lo" || echo "No interfaces found"
   echo ""
   
-  # MAC addresses
   echo "=== MAC Addresses ==="
   for iface in /sys/class/net/*; do
     if [ "$(basename "$iface")" != "lo" ]; then
@@ -138,29 +257,18 @@ get_network_interfaces() {
 
 get_wifi_info() {
   echo "=== WiFi Information ==="
-  
-  # Check if WiFi interface exists
   local wifi_iface
-  wifi_iface=$(iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}')
-  
+  wifi_iface="$(get_wifi_interface)"
   if [ -n "$wifi_iface" ]; then
     echo "WiFi Interface: $wifi_iface"
-    
-    # Current connection
     if command -v iwgetid &> /dev/null; then
       local ssid
       ssid=$(iwgetid -r 2>/dev/null || echo "Not connected")
       echo "Connected SSID: $ssid"
     fi
-    
-    # WiFi power
     local wifi_power
     wifi_power=$(iw dev "$wifi_iface" info 2>/dev/null | grep "txpower" | awk '{print $2, $3}')
-    if [ -n "$wifi_power" ]; then
-      echo "TX Power: $wifi_power"
-    fi
-    
-    # Link quality
+    [ -n "$wifi_power" ] && echo "TX Power: $wifi_power"
     if [ -f "/proc/net/wireless" ]; then
       echo ""
       echo "=== Wireless Signal ==="
@@ -173,7 +281,6 @@ get_wifi_info() {
 
 get_bluetooth_info() {
   echo "=== Bluetooth Information ==="
-  
   if command -v hciconfig &> /dev/null; then
     hciconfig -a 2>/dev/null || echo "Bluetooth not available or disabled"
   else
@@ -183,7 +290,6 @@ get_bluetooth_info() {
 
 get_os_info() {
   echo "=== Operating System ==="
-  
   if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release
@@ -192,7 +298,6 @@ get_os_info() {
     echo "ID: $ID"
     echo "Codename: $VERSION_CODENAME"
   fi
-  
   echo "Kernel: $(uname -r)"
   echo "Architecture: $(uname -m)"
   echo "Hostname: $(hostname)"
@@ -200,15 +305,8 @@ get_os_info() {
 
 get_boot_info() {
   echo "=== Boot Configuration ==="
-  
-  # Check both possible locations for config.txt
-  local config_file=""
-  if [ -f /boot/firmware/config.txt ]; then
-    config_file="/boot/firmware/config.txt"
-  elif [ -f /boot/config.txt ]; then
-    config_file="/boot/config.txt"
-  fi
-  
+  local config_file
+  config_file="$(get_boot_config_file)"
   if [ -n "$config_file" ]; then
     echo "Config file: $config_file"
     echo ""
@@ -228,34 +326,26 @@ get_temperature() {
 
 get_cpu_info() {
   echo "=== CPU Information ==="
-  
   if [ -f /proc/cpuinfo ]; then
-    echo "Model: $(grep "^model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
-    echo "Hardware: $(grep "^Hardware" /proc/cpuinfo | cut -d: -f2 | xargs)"
+    echo "Model: $(grep "^model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs || echo "N/A")"
+    echo "Hardware: $(grep "^Hardware" /proc/cpuinfo | cut -d: -f2 | xargs || echo "N/A")"
     echo "Cores: $(nproc)"
-    echo "BogoMIPS: $(grep "^BogoMIPS" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+    echo "BogoMIPS: $(grep "^BogoMIPS" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs || echo "N/A")"
   fi
-  
-  # CPU frequency
   if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
     local freq
     freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
     echo "Current Frequency: $((freq / 1000)) MHz"
   fi
-  
-  # Temperature
   echo "Temperature: $(get_temperature)"
 }
 
 get_gpio_info() {
   echo "=== GPIO Information ==="
-  
   if command -v pinout &> /dev/null; then
     echo "GPIO layout available via 'pinout' command"
     echo "Run 'pinout' on the Pi to see the full layout"
   fi
-  
-  # List available GPIO pins
   if [ -d /sys/class/gpio ]; then
     echo "GPIO sysfs available at /sys/class/gpio"
   fi
@@ -263,9 +353,7 @@ get_gpio_info() {
 
 get_installed_packages() {
   echo "=== Key Installed Packages ==="
-  
   local packages=("python3" "git" "nodejs" "docker" "nginx" "apache2")
-  
   for pkg in "${packages[@]}"; do
     if command -v "$pkg" &> /dev/null; then
       local version
@@ -282,175 +370,97 @@ get_uptime_info() {
 }
 
 ############################################################
-# Setup Script Summary (mirrors your setup script settings)
+# CSV generation
 ############################################################
 
-get_setup_summary() {
-  echo "=== Setup Script Summary ==="
-
-  local boot_config=""
-  if [ -f /boot/firmware/config.txt ]; then
-    boot_config="/boot/firmware/config.txt"
-  elif [ -f /boot/config.txt ]; then
-    boot_config="/boot/config.txt"
-  fi
-
-  local current_swap
-  current_swap=$(free -m | awk '/^Swap:/ {print $2}')
-  local swap_state
-  swap_state=$([ "$current_swap" -ge 1024 ] && echo "enabled" || echo "disabled")
-
-  local vnc_status
-  vnc_status=$(systemctl is-enabled vncserver-x11-serviced.service 2>/dev/null | grep -q enabled && echo "enabled" || echo "disabled")
-
-  local ufw_status
-  ufw_status=$(sudo ufw status 2>/dev/null | grep -qw "active" && echo "enabled" || echo "disabled")
-
-  local spi_state
-  spi_state=$(grep -q '^dtparam=spi=on' "$boot_config" 2>/dev/null && echo "enabled" || echo "disabled")
-
-  local i2c_state
-  i2c_state=$(grep -q '^dtparam=i2c_arm=on' "$boot_config" 2>/dev/null && echo "enabled" || echo "disabled")
-
-  local camera_state
-  camera_state=$(vcgencmd get_camera 2>/dev/null | grep -q 'supported=1 detected=1' && echo "enabled" || echo "disabled")
-
-  local git_name
-  git_name="$(git config --global user.name 2>/dev/null || echo "not set")"
-  local git_email
-  git_email="$(git config --global user.email 2>/dev/null || echo "not set")"
-
-  local py_requests
-  py_requests=$(pip3 list 2>/dev/null | grep -qw requests && echo "installed" || echo "not installed")
-
-  local profile_status
-  profile_status="$(grep PROFILE= "$STATE_FILE" 2>/dev/null | cut -d= -f2 | grep -oE '[^ ]+' || echo "not set")"
-
-  local hostname_disp
-  hostname_disp="$(hostname)"
-
-  local network_manager="unknown"
-  if systemctl is-active --quiet dhcpcd 2>/dev/null; then
-    network_manager="dhcpcd"
-  elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
-    network_manager="NetworkManager"
-  fi
-
-  echo "Hostname: $hostname_disp"
-  echo "Profile: $profile_status"
-  echo "Swap: $swap_state (${current_swap} MB)"
-  echo "SPI: $spi_state"
-  echo "I2C: $i2c_state"
-  echo "Camera: $camera_state"
-  echo "VNC: $vnc_status"
-  echo "Firewall (UFW): $ufw_status"
-  echo "Git: $git_name <$git_email>"
-  echo "Python requests: $py_requests"
-  echo "Network manager: $network_manager"
-  if [ -n "$boot_config" ]; then
-    echo "Boot config file: $boot_config"
-  fi
-}
-
-############################################################
-# CSV helpers
-############################################################
-
-csv_escape() {
-  # Escape double quotes for CSV
-  local s="$1"
-  s="${s//\"/\"\"}"
-  echo "$s"
-}
-
-csv_line() {
-  local key="$1"
-  local val="$2"
-  echo "\"$(csv_escape "$key")\",\"$(csv_escape "$val")\""
-}
-
-build_csv() {
-  local serial model revision memory storage hostname os_pretty os_version kernel arch
-  local uptime boot_time boot_config network_manager current_swap swap_state
-  local spi_state i2c_state camera_state vnc_status ufw_status git_name git_email py_requests profile_status
-
+generate_csv() {
+  local serial hostname mac model revision mem
   serial=$(get_serial)
+  hostname=$(hostname)
+  mac=$(get_primary_mac_address)
   model=$(get_model)
   revision=$(get_revision)
-  memory=$(get_memory)
-  storage=$(get_storage)
-  hostname=$(hostname)
+  mem=$(get_memory)
 
+  local root_stats
+  root_stats=$(get_root_fs_stats)
+  IFS=',' read -r ROOT_TOTAL ROOT_USED ROOT_AVAIL ROOT_USE_PCT <<< "$root_stats"
+
+  local swap_total_mb swap_state
+  swap_total_mb=$(get_swap_total_mb)
+  swap_state=$(get_swap_state)
+
+  local os_dist os_ver os_id os_codename
   if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
-    . /etc/os-release
-    os_pretty="$PRETTY_NAME"
-    os_version="$VERSION"
-  else
-    os_pretty=""
-    os_version=""
+    source /etc/os-release
+    os_dist="$PRETTY_NAME"
+    os_ver="$VERSION"
+    os_id="$ID"
+    os_codename="$VERSION_CODENAME"
   fi
 
+  local kernel arch uptime_str boot_time
   kernel=$(uname -r)
   arch=$(uname -m)
-  uptime=$(uptime -p)
+  uptime_str=$(uptime -p)
   boot_time=$(uptime -s)
 
-  if [ -f /boot/firmware/config.txt ]; then
-    boot_config="/boot/firmware/config.txt"
-  elif [ -f /boot/config.txt ]; then
-    boot_config="/boot/config.txt"
-  else
-    boot_config=""
-  fi
+  local usb_ctrl wifi_iface wifi_ssid boot_cfg spi_state i2c_state cam_state
+  usb_ctrl=$(get_usb_controllers_count)
+  wifi_iface=$(get_wifi_interface)
+  wifi_ssid=$(get_wifi_ssid)
+  boot_cfg=$(get_boot_config_file)
+  spi_state=$(get_spi_state)
+  i2c_state=$(get_i2c_state)
+  cam_state=$(get_camera_state)
 
-  if systemctl is-active --quiet dhcpcd 2>/dev/null; then
-    network_manager="dhcpcd"
-  elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
-    network_manager="NetworkManager"
-  else
-    network_manager="unknown"
-  fi
-
-  current_swap=$(free -m | awk '/^Swap:/ {print $2}')
-  swap_state=$([ "$current_swap" -ge 1024 ] && echo "enabled" || echo "disabled")
-  spi_state=$(grep -q '^dtparam=spi=on' "$boot_config" 2>/dev/null && echo "enabled" || echo "disabled")
-  i2c_state=$(grep -q '^dtparam=i2c_arm=on' "$boot_config" 2>/dev/null && echo "enabled" || echo "disabled")
-  camera_state=$(vcgencmd get_camera 2>/dev/null | grep -q 'supported=1 detected=1' && echo "enabled" || echo "disabled")
-  vnc_status=$(systemctl is-enabled vncserver-x11-serviced.service 2>/dev/null | grep -q enabled && echo "enabled" || echo "disabled")
-  ufw_status=$(sudo ufw status 2>/dev/null | grep -qw "active" && echo "enabled" || echo "disabled")
-  git_name=$(git config --global user.name 2>/dev/null || echo "not set")
+  local vnc_state ufw_state git_user git_email req_state profile net_mgr
+  vnc_state=$(get_vnc_state)
+  ufw_state=$(get_ufw_status)
+  git_user=$(git config --global user.name 2>/dev/null || echo "not set")
   git_email=$(git config --global user.email 2>/dev/null || echo "not set")
-  py_requests=$(pip3 list 2>/dev/null | grep -qw requests && echo "installed" || echo "not installed")
-  profile_status=$(grep PROFILE= "$STATE_FILE" 2>/dev/null | cut -d= -f2 | grep -oE '[^ ]+' || echo "not set")
+  req_state=$(get_requests_state)
+  profile=$(get_setup_profile)
+  net_mgr=$(detect_network_manager)
 
   {
-    echo "key,value"
-    csv_line "serial" "$serial"
-    csv_line "model" "$model"
-    csv_line "revision" "$revision"
-    csv_line "memory" "$memory"
-    csv_line "storage" "$storage"
-    csv_line "hostname" "$hostname"
-    csv_line "os_pretty_name" "$os_pretty"
-    csv_line "os_version" "$os_version"
-    csv_line "kernel" "$kernel"
-    csv_line "architecture" "$arch"
-    csv_line "uptime_pretty" "$uptime"
-    csv_line "boot_time" "$boot_time"
-    csv_line "boot_config_file" "$boot_config"
-    csv_line "network_manager" "$network_manager"
-    csv_line "swap_state" "$swap_state"
-    csv_line "swap_mb" "$current_swap"
-    csv_line "spi" "$spi_state"
-    csv_line "i2c" "$i2c_state"
-    csv_line "camera" "$camera_state"
-    csv_line "vnc" "$vnc_status"
-    csv_line "ufw" "$ufw_status"
-    csv_line "git_name" "$git_name"
-    csv_line "git_email" "$git_email"
-    csv_line "python_requests" "$py_requests"
-    csv_line "profile" "$profile_status"
+    echo "Key,Value"
+    echo "Serial Number,$(csv_escape "$serial")"
+    echo "Hostname,$(csv_escape "$hostname")"
+    echo "MAC Address,$(csv_escape "$mac")"
+    echo "Model,$(csv_escape "$model")"
+    echo "Revision,$(csv_escape "$revision")"
+    echo "Memory,$(csv_escape "$mem")"
+    echo "Root FS Total,$(csv_escape "$ROOT_TOTAL")"
+    echo "Root FS Used,$(csv_escape "$ROOT_USED")"
+    echo "Root FS Available,$(csv_escape "$ROOT_AVAIL")"
+    echo "Root FS Use %,$(csv_escape "$ROOT_USE_PCT")"
+    echo "Swap Total (MB),$(csv_escape "$swap_total_mb")"
+    echo "Swap State,$(csv_escape "$swap_state")"
+    echo "OS Distribution,$(csv_escape "$os_dist")"
+    echo "OS Version,$(csv_escape "$os_ver")"
+    echo "OS ID,$(csv_escape "$os_id")"
+    echo "OS Codename,$(csv_escape "$os_codename")"
+    echo "Kernel,$(csv_escape "$kernel")"
+    echo "Architecture,$(csv_escape "$arch")"
+    echo "Uptime,$(csv_escape "$uptime_str")"
+    echo "Boot Time,$(csv_escape "$boot_time")"
+    echo "USB Controllers,$(csv_escape "$usb_ctrl")"
+    echo "WiFi Interface,$(csv_escape "$wifi_iface")"
+    echo "WiFi SSID,$(csv_escape "$wifi_ssid")"
+    echo "Boot Config File,$(csv_escape "$boot_cfg")"
+    echo "SPI,$(csv_escape "$spi_state")"
+    echo "I2C,$(csv_escape "$i2c_state")"
+    echo "Camera,$(csv_escape "$cam_state")"
+    echo "Swap,$(csv_escape "$swap_total_mb MB")"
+    echo "VNC,$(csv_escape "$vnc_state")"
+    echo "Firewall (UFW),$(csv_escape "$ufw_state")"
+    echo "Git User,$(csv_escape "$git_user")"
+    echo "Git Email,$(csv_escape "$git_email")"
+    echo "Python 'requests' package,$(csv_escape "$req_state")"
+    echo "Setup Profile,$(csv_escape "$profile")"
+    echo "Network Manager,$(csv_escape "$net_mgr")"
   }
 }
 
@@ -469,10 +479,12 @@ collect_all_info() {
   
   output+="=== Hardware Identification ===\n"
   output+="Serial Number: $(get_serial)\n"
+  output+="Hostname: $(hostname)\n"
   output+="Model: $(get_model)\n"
   output+="Revision: $(get_revision)\n"
   output+="Memory: $(get_memory)\n"
   output+="Storage: $(get_storage)\n"
+  output+="MAC Address: $(get_primary_mac_address)\n"
   output+="\n"
   
   output+="$(get_cpu_info)\n\n"
@@ -480,7 +492,7 @@ collect_all_info() {
   output+="$(get_uptime_info)\n\n"
   
   output+="=== USB Information ===\n"
-  output+="$(get_usb_ports)\n"
+  output+="$(get_usb_controllers_count) USB controllers detected\n"
   output+="$(get_usb_info)\n\n"
   
   output+="$(get_network_interfaces)\n\n"
@@ -490,8 +502,25 @@ collect_all_info() {
   output+="$(get_boot_info)\n\n"
   output+="$(get_installed_packages)\n\n"
 
-  # Add summary of settings from your setup script
-  output+="$(get_setup_summary)\n\n"
+  # Setup-related configuration
+  output+="=== Setup / Feature Configuration ===\n"
+  output+="Root FS Total: $(echo "$(get_root_fs_stats)" | cut -d',' -f1)\n"
+  output+="Root FS Used: $(echo "$(get_root_fs_stats)" | cut -d',' -f2)\n"
+  output+="Root FS Available: $(echo "$(get_root_fs_stats)" | cut -d',' -f3)\n"
+  output+="Root FS Use %: $(echo "$(get_root_fs_stats)" | cut -d',' -f4)\n"
+  output+="Swap Total (MB): $(get_swap_total_mb)\n"
+  output+="Swap State: $(get_swap_state)\n"
+  output+="SPI: $(get_spi_state)\n"
+  output+="I2C: $(get_i2c_state)\n"
+  output+="Camera: $(get_camera_state)\n"
+  output+="VNC: $(get_vnc_state)\n"
+  output+="Firewall (UFW): $(get_ufw_status)\n"
+  output+="Git User: $(git config --global user.name 2>/dev/null || echo "not set")\n"
+  output+="Git Email: $(git config --global user.email 2>/dev/null || echo "not set")\n"
+  output+="Python 'requests' package: $(get_requests_state)\n"
+  output+="Setup Profile: $(get_setup_profile)\n"
+  output+="Network Manager: $(detect_network_manager)\n"
+  output+="\n"
   
   output+="============================================\n"
   output+="END OF REPORT\n"
@@ -501,107 +530,95 @@ collect_all_info() {
 }
 
 ############################################################
-# Email the file (with CSV attachment)
+# Email with attachment
 ############################################################
 
-send_email() {
-  local content="$1"
-  local serial="$2"
-  local date_stamp="$3"
+send_email_with_attachment() {
+  local text_file="$1"
+  local csv_file="$2"
+  local subject="$3"
   local email_to="$4"
-  local csv_content="$5"
 
-  local hostname_full
-  hostname_full="$(hostname)"
-  local time_stamp
-  time_stamp=$(date '+%H:%M')
-
-  # Subject: include hostname, serial, date and time
-  local subject="Raspberry Pi Info - ${hostname_full} - ${serial} - ${date_stamp} ${time_stamp}"
-
-  # CSV filename must be exactly the subject line (no extra extension)
-  local csv_filename="$subject"
-
-  # Temporary files
-  local tmp_body tmp_csv
-  tmp_body=$(mktemp)
-  tmp_csv=$(mktemp)
-
-  echo -e "$content" > "$tmp_body"
-  echo -e "$csv_content" > "$tmp_csv"
+  local boundary="====RPIINFO_$(date +%s)_$$===="
+  local from_addr="pi@$(hostname)"
+  local csv_filename="${subject}.csv"
 
   log_info "Sending email to: $email_to"
-  log_info "Email subject: $subject"
-  log_info "CSV attachment filename: $csv_filename"
-
-  local boundary="=====RPIINFO_BOUNDARY_$$====="
-
-  # Helper to build MIME message with attachment
-  build_mime_message() {
-    echo "To: $email_to"
-    echo "From: pi@$hostname_full"
-    echo "Subject: $subject"
-    echo "MIME-Version: 1.0"
-    echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
-    echo
-    echo "This is a multi-part message in MIME format."
-    echo
-    echo "--$boundary"
-    echo "Content-Type: text/plain; charset=\"UTF-8\""
-    echo "Content-Transfer-Encoding: 8bit"
-    echo
-    cat "$tmp_body"
-    echo
-    echo "--$boundary"
-    echo "Content-Type: text/csv; name=\"$csv_filename\""
-    echo "Content-Transfer-Encoding: base64"
-    echo "Content-Disposition: attachment; filename=\"$csv_filename\""
-    echo
-    base64 "$tmp_csv"
-    echo
-    echo "--$boundary--"
-  }
-
-  # Method 1: msmtp (recommended)
+  
   if command -v msmtp &> /dev/null; then
-    if build_mime_message | msmtp "$email_to"; then
-      rm -f "$tmp_body" "$tmp_csv"
-      log_success "Email sent successfully via msmtp (with CSV attachment)"
+    (
+      echo "To: $email_to"
+      echo "From: $from_addr"
+      echo "Subject: $subject"
+      echo "MIME-Version: 1.0"
+      echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
+      echo
+      echo "--$boundary"
+      echo "Content-Type: text/plain; charset=UTF-8"
+      echo "Content-Transfer-Encoding: 7bit"
+      echo
+      cat "$text_file"
+      echo
+      echo "--$boundary"
+      echo "Content-Type: text/csv; name=\"$csv_filename\""
+      echo "Content-Transfer-Encoding: base64"
+      echo "Content-Disposition: attachment; filename=\"$csv_filename\""
+      echo
+      base64 "$csv_file"
+      echo
+      echo "--$boundary--"
+    ) | msmtp "$email_to"
+    if [ $? -eq 0 ]; then
+      log_success "Email sent successfully via msmtp"
       return 0
-    else
-      log_warning "msmtp send failed, trying other methods..."
     fi
   fi
-  
-  # Method 2: sendmail
+
   if command -v sendmail &> /dev/null; then
-    if build_mime_message | sendmail -t; then
-      rm -f "$tmp_body" "$tmp_csv"
-      log_success "Email sent successfully via sendmail (with CSV attachment)"
+    (
+      echo "To: $email_to"
+      echo "From: $from_addr"
+      echo "Subject: $subject"
+      echo "MIME-Version: 1.0"
+      echo "Content-Type: multipart/mixed; boundary=\"$boundary\""
+      echo
+      echo "--$boundary"
+      echo "Content-Type: text/plain; charset=UTF-8"
+      echo "Content-Transfer-Encoding: 7bit"
+      echo
+      cat "$text_file"
+      echo
+      echo "--$boundary"
+      echo "Content-Type: text/csv; name=\"$csv_filename\""
+      echo "Content-Transfer-Encoding: base64"
+      echo "Content-Disposition: attachment; filename=\"$csv_filename\""
+      echo
+      base64 "$csv_file"
+      echo
+      echo "--$boundary--"
+    ) | sendmail -t
+    if [ $? -eq 0 ]; then
+      log_success "Email sent successfully via sendmail"
       return 0
-    else
-      log_warning "sendmail send failed, trying mail/mailx..."
     fi
   fi
-  
-  # Method 3: mail/mailx (fallback, plain body only, no attachment)
+
   if command -v mail &> /dev/null; then
-    if mail -s "$subject" "$email_to" < "$tmp_body"; then
-      rm -f "$tmp_body" "$tmp_csv"
-      log_success "Email sent successfully via mail (WITHOUT attachment fallback)"
-      log_warning "Install msmtp or sendmail for CSV attachment support."
+    log_warning "mail found but attachment support is not configured; sending text body only."
+    mail -s "$subject" "$email_to" < "$text_file"
+    if [ $? -eq 0 ]; then
+      log_success "Email sent successfully via mail (no attachment)"
       return 0
     fi
   fi
-  
-  rm -f "$tmp_body" "$tmp_csv"
-  log_error "No suitable email client found or all methods failed."
-  log_info "To get attachments, install and configure msmtp (recommended) or sendmail."
+
+  log_error "No suitable email client found (msmtp/sendmail/mail)."
+  log_info "To install msmtp: sudo apt-get install msmtp msmtp-mta"
   return 1
 }
 
 ############################################################
-# Save to Dropbox (text report only)
+# Save to Dropbox
 ############################################################
 
 save_to_dropbox() {
@@ -610,7 +627,6 @@ save_to_dropbox() {
   local date_stamp="$3"
   local filename="${serial}_${date_stamp}.txt"
   
-  # Check if Dropbox folder exists
   local dropbox_paths=(
     "$HOME/Dropbox"
     "$HOME/dropbox"
@@ -632,13 +648,10 @@ save_to_dropbox() {
     dropbox_dir="$HOME/Dropbox"
   fi
   
-  # Create subdirectory for Pi info
   local save_dir="$dropbox_dir/RaspberryPi_Info"
   mkdir -p "$save_dir"
   
   local filepath="$save_dir/$filename"
-  
-  # Save the file
   echo -e "$content" > "$filepath"
   
   if [ -f "$filepath" ]; then
@@ -657,7 +670,6 @@ save_to_dropbox() {
 # Main Execution
 ############################################################
 
-# Parse command line arguments
 EMAIL_ADDRESS=""
 SKIP_DROPBOX=false
 
@@ -682,7 +694,7 @@ while [[ $# -gt 0 ]]; do
       echo "Examples:"
       echo "  $0                              # Save to Dropbox only"
       echo "  $0 --email user@example.com     # Email (with CSV) and save to Dropbox"
-      echo "  $0 -e user@example.com --no-dropbox  # Email only (with CSV)"
+      echo "  $0 -e user@example.com --no-dropbox  # Email only"
       exit 0
       ;;
     *)
@@ -694,41 +706,47 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=========================================="
-echo "MML Raspberry Pi Information Collector 1a"
+echo "Raspberry Pi Information Collector"
 echo "=========================================="
 echo ""
 
 log_info "Collecting system information..."
 
-# Get serial number and date
 SERIAL=$(get_serial)
 DATE_STAMP=$(date '+%Y-%m-%d')
+TIME_STAMP=$(date '+%H:%M')
 
 log_info "Serial Number: $SERIAL"
 log_info "Date: $DATE_STAMP"
+log_info "Time: $TIME_STAMP"
 echo ""
 
-# Collect all information (text report)
 INFO=$(collect_all_info)
+CSV_CONTENT=$(generate_csv)
 
-# Build CSV summary
-CSV_CONTENT=$(build_csv)
-
-# Display to screen
+# Show on screen
 echo "$INFO"
 echo ""
 
-# Save to Dropbox (text file)
+# Save text report to Dropbox
 if [ "$SKIP_DROPBOX" = false ]; then
   log_info "Saving to Dropbox..."
   save_to_dropbox "$INFO" "$SERIAL" "$DATE_STAMP"
 fi
 
-# Send email if requested (text + CSV attachment)
+# Prepare temp files for email
+TEXT_TMP=$(mktemp)
+CSV_TMP=$(mktemp)
+echo -e "$INFO" > "$TEXT_TMP"
+echo -e "$CSV_CONTENT" > "$CSV_TMP"
+
 if [ -n "$EMAIL_ADDRESS" ]; then
+  SUBJECT="Raspberry Pi Info - $(hostname) - $SERIAL - ${DATE_STAMP} ${TIME_STAMP}"
   echo ""
-  send_email "$INFO" "$SERIAL" "$DATE_STAMP" "$EMAIL_ADDRESS" "$CSV_CONTENT"
+  send_email_with_attachment "$TEXT_TMP" "$CSV_TMP" "$SUBJECT" "$EMAIL_ADDRESS"
 fi
+
+rm -f "$TEXT_TMP" "$CSV_TMP"
 
 echo ""
 log_success "Collection complete!"
