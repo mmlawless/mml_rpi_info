@@ -543,8 +543,7 @@ send_() {
   local content_csv="$2"
   local subject="$3"
   local email_to="$4"
-  local csvsubject="$4"
-  
+    
   local serial="$5"      # just for logging if needed
   local date_stamp="$6"  # just for logging if needed
   
@@ -560,7 +559,7 @@ send_() {
   hostname_full=$(hostname)
   
   local boundary="====MIME_BOUNDARY_$$_${RANDOM}===="
-  local csv_filename="${csvsubject}.csv"
+  local csv_filename="${subject}.csv"
   
   log_info "Sending email to: $email_to"
   log_info "Email subject: $subject"
