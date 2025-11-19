@@ -94,7 +94,8 @@ get_storage() {
 get_usb_info() {
   # Count and list USB devices
   if command -v lsusb &> /dev/null; then
-    local usb_count=$(lsusb | wc -l)
+    local usb_count
+    usb_count=$(lsusb | wc -l)
     echo "USB Devices Found: $usb_count"
     lsusb
   else
@@ -103,9 +104,10 @@ get_usb_info() {
 }
 
 get_usb_ports() {
-  # Try to determine number of physical USB ports
+  # Try to determine number of physical USB ports/controllers
   if [ -d /sys/bus/usb/devices ]; then
-    local ports=$(find /sys/bus/usb/devices -name "usb*" -type d | wc -l)
+    local ports
+    ports=$(find /sys/bus/usb/devices -name "usb*" -type d | wc -l)
     echo "$ports USB controllers detected"
   else
     echo "Unknown"
@@ -120,9 +122,10 @@ get_network_interfaces() {
   # MAC addresses
   echo "=== MAC Addresses ==="
   for iface in /sys/class/net/*; do
-    if [ "$(basename $iface)" != "lo" ]; then
-      local mac=$(cat "$iface/address" 2>/dev/null || echo "N/A")
-      echo "$(basename $iface): $mac"
+    if [ "$(basename "$iface")" != "lo" ]; then
+      local mac
+      mac=$(cat "$iface/address" 2>/dev/null || echo "N/A")
+      echo "$(basename "$iface"): $mac"
     fi
   done
 }
@@ -131,19 +134,22 @@ get_wifi_info() {
   echo "=== WiFi Information ==="
   
   # Check if WiFi interface exists
-  local wifi_iface=$(iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}')
+  local wifi_iface
+  wifi_iface=$(iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}')
   
   if [ -n "$wifi_iface" ]; then
     echo "WiFi Interface: $wifi_iface"
     
     # Current connection
     if command -v iwgetid &> /dev/null; then
-      local ssid=$(iwgetid -r 2>/dev/null || echo "Not connected")
+      local ssid
+      ssid=$(iwgetid -r 2>/dev/null || echo "Not connected")
       echo "Connected SSID: $ssid"
     fi
     
     # WiFi power
-    local wifi_power=$(iw dev "$wifi_iface" info 2>/dev/null | grep "txpower" | awk '{print $2, $3}')
+    local wifi_power
+    wifi_power=$(iw dev "$wifi_iface" info 2>/dev/null | grep "txpower" | awk '{print $2, $3}')
     if [ -n "$wifi_power" ]; then
       echo "TX Power: $wifi_power"
     fi
@@ -173,6 +179,7 @@ get_os_info() {
   echo "=== Operating System ==="
   
   if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
     source /etc/os-release
     echo "Distribution: $PRETTY_NAME"
     echo "Version: $VERSION"
@@ -225,7 +232,8 @@ get_cpu_info() {
   
   # CPU frequency
   if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
-    local freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+    local freq
+    freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
     echo "Current Frequency: $((freq / 1000)) MHz"
   fi
   
@@ -254,7 +262,8 @@ get_installed_packages() {
   
   for pkg in "${packages[@]}"; do
     if command -v "$pkg" &> /dev/null; then
-      local version=$($pkg --version 2>&1 | head -1)
+      local version
+      version=$($pkg --version 2>&1 | head -1)
       echo "$pkg: $version"
     fi
   done
@@ -264,6 +273,115 @@ get_uptime_info() {
   echo "=== System Uptime ==="
   uptime -p
   echo "Boot time: $(uptime -s)"
+}
+
+############################################################
+# Setup Script Configuration Summary
+# Mirrors the key settings from your setup script
+############################################################
+
+get_setup_config_summary() {
+  echo "=== Setup Script Configuration Summary ==="
+
+  # Boot config path
+  local boot_config=""
+  if [ -f /boot/firmware/config.txt ]; then
+    boot_config="/boot/firmware/config.txt"
+  elif [ -f /boot/config.txt ]; then
+    boot_config="/boot/config.txt"
+  else
+    boot_config="(not found)"
+  fi
+  echo "Boot config: $boot_config"
+
+  # Network manager (dhcpcd / NetworkManager / unknown)
+  local network_manager="unknown"
+  if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+    network_manager="dhcpcd"
+  elif systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    network_manager="NetworkManager"
+  fi
+  echo "Network manager: $network_manager"
+
+  # OS codename
+  if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    echo "OS codename: $VERSION_CODENAME"
+  fi
+
+  # Swap
+  local current_swap
+  current_swap=$(free -m | awk '/^Swap:/ {print $2}')
+  local swap_state="disabled"
+  if [ "$current_swap" -ge 1024 ]; then
+    swap_state="enabled"
+  fi
+  echo "Swap: $swap_state (${current_swap} MB)"
+
+  # SPI / I2C (from boot config)
+  if [ -f "$boot_config" ] && [ "$boot_config" != "(not found)" ]; then
+    local spi_state="disabled"
+    local i2c_state="disabled"
+    grep -q '^dtparam=spi=on' "$boot_config" 2>/dev/null && spi_state="enabled"
+    grep -q '^dtparam=i2c_arm=on' "$boot_config" 2>/dev/null && i2c_state="enabled"
+    echo "SPI: $spi_state"
+    echo "I2C: $i2c_state"
+  fi
+
+  # Camera (via vcgencmd)
+  if command -v vcgencmd >/dev/null 2>&1; then
+    local cam_state="disabled or not detected"
+    if vcgencmd get_camera 2>/dev/null | grep -q 'supported=1 detected=1'; then
+      cam_state="enabled and detected"
+    fi
+    echo "Camera: $cam_state"
+  fi
+
+  # VNC service
+  local vnc_state="unknown"
+  if systemctl list-unit-files vncserver-x11-serviced.service >/dev/null 2>&1; then
+    if systemctl is-enabled vncserver-x11-serviced.service 2>/dev/null | grep -q enabled; then
+      vnc_state="enabled"
+    else
+      vnc_state="disabled"
+    fi
+  fi
+  echo "VNC service: $vnc_state"
+
+  # Firewall (UFW)
+  local ufw_state="disabled"
+  if command -v ufw >/dev/null 2>&1; then
+    if sudo ufw status 2>/dev/null | grep -qw "active"; then
+      ufw_state="enabled"
+    fi
+  fi
+  echo "Firewall (UFW): $ufw_state"
+
+  # Git global config
+  local git_name git_email
+  git_name="$(git config --global user.name 2>/dev/null || echo "not set")"
+  git_email="$(git config --global user.email 2>/dev/null || echo "not set")"
+  echo "Git user: $git_name"
+  echo "Git email: $git_email"
+
+  # Python 'requests'
+  local requests_state="not installed"
+  if command -v pip3 >/dev/null 2>&1 && pip3 list 2>/dev/null | grep -qw requests; then
+    requests_state="installed"
+  fi
+  echo "Python 'requests' package: $requests_state"
+
+  # Setup profile from state file
+  local profile_state="not set"
+  local state_file="$HOME/.rpi_setup_state"
+  if [ -f "$state_file" ]; then
+    profile_state=$(grep PROFILE= "$state_file" 2>/dev/null | cut -d= -f2 | grep -oE '[^ ]+' || echo "not set")
+  fi
+  echo "Setup profile: $profile_state"
+
+  # Hostname (for completeness)
+  echo "Hostname: $(hostname)"
 }
 
 ############################################################
@@ -300,6 +418,7 @@ collect_all_info() {
   output+="$(get_bluetooth_info)\n\n"
   output+="$(get_gpio_info)\n\n"
   output+="$(get_boot_info)\n\n"
+  output+="$(get_setup_config_summary)\n\n"
   output+="$(get_installed_packages)\n\n"
   
   output+="============================================\n"
@@ -319,9 +438,17 @@ send_email() {
   local date_stamp="$3"
   local email_to="$4"
   local filename="${serial}_${date_stamp}.txt"
+
+  # For subject line: include hostname, serial, date and time (HH:MM)
+  local host
+  host=$(hostname)
+  local time_stamp
+  time_stamp=$(date '+%H:%M')
+  local subject="Raspberry Pi Info - ${host} - ${serial} - ${date_stamp} ${time_stamp}"
   
   # Create temporary file
-  local tmpfile=$(mktemp)
+  local tmpfile
+  tmpfile=$(mktemp)
   echo -e "$content" > "$tmpfile"
   
   log_info "Sending email to: $email_to"
@@ -331,7 +458,7 @@ send_email() {
     (
       echo "To: $email_to"
       echo "From: pi@$(hostname)"
-      echo "Subject: Raspberry Pi Info - $serial - $date_stamp"
+      echo "Subject: $subject"
       echo "Content-Type: text/plain; charset=UTF-8"
       echo ""
       cat "$tmpfile"
@@ -348,7 +475,7 @@ send_email() {
   if command -v sendmail &> /dev/null; then
     (
       echo "To: $email_to"
-      echo "Subject: Raspberry Pi Info - $serial - $date_stamp"
+      echo "Subject: $subject"
       echo ""
       cat "$tmpfile"
     ) | sendmail -t
@@ -362,7 +489,7 @@ send_email() {
   
   # Method 3: Try mail/mailx
   if command -v mail &> /dev/null; then
-    mail -s "Raspberry Pi Info - $serial - $date_stamp" "$email_to" < "$tmpfile"
+    mail -s "$subject" "$email_to" < "$tmpfile"
     
     if [ $? -eq 0 ]; then
       rm "$tmpfile"
@@ -508,4 +635,4 @@ echo ""
 log_success "Collection complete!"
 echo ""
 log_info "You can also save this output with:"
-echo "  ./$(basename $0) > ~/rpi_info_${SERIAL}_${DATE_STAMP}.txt"
+echo "  ./$(basename "$0") > ~/rpi_info_${SERIAL}_${DATE_STAMP}.txt"
