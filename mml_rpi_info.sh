@@ -352,11 +352,11 @@ get_setup_settings() {
   echo "Firewall (UFW): $ufw_state"
   
   # Git config
-  local git_user git_email
+  local git_user git_
   git_user="$(git config --global user.name 2>/dev/null || echo "not set")"
-  git_email="$(git config --global user.email 2>/dev/null || echo "not set")"
+  git_="$(git config --global user. 2>/dev/null || echo "not set")"
   echo "Git User: $git_user"
-  echo "Git Email: $git_email"
+  echo "Git : $git_"
   
   # Python requests package
   local requests_state="not installed"
@@ -535,14 +535,15 @@ collect_all_info() {
 }
 
 ############################################################
-# Email the file (text + CSV attachment)
+#  the file (text + CSV attachment)
 ############################################################
 
-send_email() {
+send_() {
   local content_text="$1"
   local content_csv="$2"
   local subject="$3"
   local email_to="$4"
+  local csvsubject="$4"
   
   local serial="$5"      # just for logging if needed
   local date_stamp="$6"  # just for logging if needed
