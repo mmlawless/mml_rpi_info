@@ -559,7 +559,7 @@ send_email() {
   hostname_full=$(hostname)
   
   local boundary="====MIME_BOUNDARY_$$_${RANDOM}===="
-  local csv_filename="${subject}.csv"
+  local csv_filename="${csvsubject}.csv"
   
   log_info "Sending email to: $email_to"
   log_info "Email subject: $subject"
@@ -761,7 +761,7 @@ HOSTNAME_FULL=$(hostname)
 # Build email/CSV subject:
 # Raspberry Pi Info - <hostname> - <serial> - YYYY-MM-DD HH:MM
 EMAIL_SUBJECT="Raspberry Pi Info - ${HOSTNAME_FULL} - ${SERIAL} - ${DATE_STAMP} ${TIME_STAMP}"
-
+CSVSUBJECT=${HOSTNAME_FULL}
 log_info "Serial Number: $SERIAL"
 log_info "Date: $DATE_STAMP"
 log_info "Time: $TIME_STAMP"
